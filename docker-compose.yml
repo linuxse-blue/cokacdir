@@ -1,0 +1,132 @@
+services:
+  cokacdir:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cokacdir-agents:latest
+    container_name: cokacdir
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+    environment:
+      COKACDIR_BOT_TOKEN: "${COKACDIR_BOT_TOKEN}"
+      COKACDIR_BOT_TOKEN_FILE: "/home/cokac/.cokacdir/bot-tokens"
+
+      AGENT_HOME: "/home/cokac/.agents"
+      NPM_CONFIG_PREFIX: "/home/cokac/.agents/npm"
+      NODE_PATH: "/home/cokac/.agents/npm/lib/node_modules"
+      BROWSER_CDP_URL: "http://browser:9222"
+      COKAC_CODEX_PATH: "/home/cokac/.agents/npm/bin/codex"
+      COKAC_CLAUDE_PATH: "/usr/local/bin/claude"
+      COKAC_AGY_PATH: "/usr/local/bin/agy"
+      COKAC_HERDR_PATH: "/usr/local/bin/herdr"
+      HERDR_MODE: "${HERDR_MODE:-internal}"
+      COKAC_HERDR_AGENT: "${COKAC_HERDR_AGENT:-worker}"
+      COKAC_HERDR_AGENT_KIND: "${COKAC_HERDR_AGENT_KIND:-codex}"
+      COKAC_HERDR_WORKDIR: "${COKAC_HERDR_WORKDIR:-/workspace}"
+      COKAC_HERDR_START_TIMEOUT_MS: "${COKAC_HERDR_START_TIMEOUT_MS:-60000}"
+      COKAC_HERDR_TIMEOUT_MS: "${COKAC_HERDR_TIMEOUT_MS:-1800000}"
+      COKAC_HERDR_COMPLETION_NOTIFY_CHAT_ID: "${COKAC_HERDR_COMPLETION_NOTIFY_CHAT_ID:-}"
+      COKAC_HERDR_COMPLETION_NOTIFY_MIN_S: "${COKAC_HERDR_COMPLETION_NOTIFY_MIN_S:-300}"
+      HERDR_SOCKET_PATH: "/home/cokac/.config/herdr/herdr.sock"
+      CLAUDE_RUN_UID: "1000"
+      CLAUDE_RUN_GID: "1000"
+      HOME: "/home/cokac"
+      COKACDIR_DEBUG: "1"
+
+      # Codex API Key 사용 시
+      OPENAI_API_KEY: "${OPENAI_API_KEY}"
+
+      # Claude API Key 사용 시
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+
+      # 필요 시 Gemini/Google 계열 인증 변수는 별도 추가
+      # GEMINI_API_KEY: "${GEMINI_API_KEY}"
+      # GOOGLE_API_KEY: "${GOOGLE_API_KEY}"
+    extra_hosts:
+      - "linuxse.duckdns.org:host-gateway"
+      - "barotalk.duckdns.org:host-gateway"
+      - "monintor-ui.duckdns.org:host-gateway"
+      - "hitam.gdc.infra:host-gateway"
+      - "ag.innonsys.com:host-gateway"
+    volumes:
+      - ${COKACDIR_WORKSPACE_DIR:-./workspace}:/workspace
+      - ./data/agents:/home/cokac/.agents
+      - ./data/cokacdir:/home/cokac/.cokacdir
+      - ./data/codex:/home/cokac/.codex
+      - ./data/gemini:/home/cokac/.gemini
+      - ./data/claude:/home/cokac/.claude
+      - ./data/local-share:/home/cokac/.local/share
+      - herdr-config:/home/cokac/.config/herdr
+
+      # Git 작업에 SSH 키가 필요할 때만 사용
+      # - ~/.ssh:/root/.ssh:ro
+      #
+      #
+
+  browser-base:
+    image: kernel-images-chromium-headful:452f342
+    scale: 0
+    build:
+      # Kernel Images는 공식 사전 빌드 이미지가 없으므로 소스에서 빌드합니다.
+      # 재현성을 위해 확인한 공식 저장소 커밋을 고정했습니다.
+      context: https://github.com/kernel/kernel-images.git#452f342387cd7f3680459cf13c257922ed46383b
+      dockerfile: images/chromium-headful/Dockerfile
+
+  browser:
+    image: playwright-novnc:452f342
+    build:
+      context: .
+      dockerfile: browser/Dockerfile
+      additional_contexts:
+        browser_base: service:browser-base
+    platform: linux/amd64
+    restart: unless-stopped
+    init: true
+    entrypoint: ["/usr/local/bin/browser-container-wrapper.sh"]
+    stop_signal: SIGTERM
+    stop_grace_period: 20s
+    privileged: true
+    shm_size: 2gb
+    mem_limit: 8g
+    # SwiftShader를 활성화하면 CPU 사용량이 늘 수 있습니다.
+    cpus: "${BROWSER_CPUS:-8}"
+
+    environment:
+      DISPLAY_NUM: "1"
+      WIDTH: "${BROWSER_WIDTH:-1920}"
+      HEIGHT: "${BROWSER_HEIGHT:-1080}"
+      BROWSER_ENABLE_WEBGL: "${BROWSER_ENABLE_WEBGL:-0}"
+      TZ: "${TZ:-Asia/Seoul}"
+      RUN_AS_ROOT: "false"
+      # 비워 두면 비밀번호 없이 접속합니다. 네트워크 공개 시 반드시 설정하세요.
+      NOVNC_PASSWORD: "${NOVNC_PASSWORD:-}"
+
+    ports:
+      # noVNC 사용자 화면: http://호스트:7903/vnc.html
+      - "${NOVNC_BIND_ADDRESS:-127.0.0.1}:${NOVNC_PORT:-7903}:6080/tcp"
+
+    # expose:
+    #   # 호스트에는 공개하지 않고 Compose 내부에서만 사용합니다.
+    #   - "9222"
+    #   - "10001"
+    extra_hosts:
+      - "linuxse.duckdns.org:host-gateway"
+      - "barotalk.duckdns.org:host-gateway"
+      - "monintor-ui.duckdns.org:host-gateway"
+    volumes:
+      # 쿠키와 로그인 상태를 컨테이너 재시작 후에도 유지합니다.
+      - browser-profile:/home/kernel/user-data
+      - browser-recordings:/recordings
+
+    healthcheck:
+      test: ["CMD", "node", "/usr/local/bin/browser-readiness.js"]
+      interval: 60s
+      timeout: 8s
+      retries: 12
+      start_period: 30s
+
+volumes:
+  herdr-config:
+  browser-profile:
+  browser-recordings:

@@ -1,0 +1,4 @@
+data/
+workspace/
+*.exe
+*.tar.gz

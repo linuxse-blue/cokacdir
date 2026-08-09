@@ -1,0 +1,12 @@
+services:
+  cokacdir:
+    # 현재 호스트에서는 기존 Herdr 세션과 Docker 개발 환경을 그대로 사용합니다.
+    environment:
+      HERDR_MODE: "external"
+
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /home/linuxse/dev:/workspace
+      - /home/linuxse/ag/vera:/workspace/vera
+      # Herdr가 재시작하며 소켓 파일을 교체할 수 있어 파일이 아닌 디렉터리를 마운트합니다.
+      - ${HERDR_CONFIG_DIR:-/home/linuxse/.config/herdr}:/home/cokac/.config/herdr

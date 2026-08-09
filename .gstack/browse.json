@@ -1,0 +1,9 @@
+{
+  "pid": 15,
+  "port": 34568,
+  "token": "4c11329f-826c-4bd1-8033-458dc003468c",
+  "startedAt": "2026-08-06T00:12:14.036Z",
+  "serverPath": "/home/linuxse/gstack/browse/src/server.ts",
+  "mode": "launched",
+  "configHash": "303a7eeccc03078b"
+}

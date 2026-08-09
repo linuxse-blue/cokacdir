@@ -1,0 +1,11 @@
+.git
+.agents
+.codex
+.env
+data
+workspace
+
+*.log
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal

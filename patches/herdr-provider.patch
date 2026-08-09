@@ -1,0 +1,754 @@
+diff --git a/src/services/mod.rs b/src/services/mod.rs
+index 3cde212..3282788 100644
+--- a/src/services/mod.rs
++++ b/src/services/mod.rs
+@@ -4,6 +4,7 @@ pub mod claude;
+ pub mod codex;
+ pub mod dedup;
+ pub mod file_ops;
++pub mod herdr;
+ pub mod memory;
+ pub mod messenger_bridge;
+ pub mod opencode;
+diff --git a/src/services/telegram.rs b/src/services/telegram.rs
+index bca929c..012b8eb 100644
+--- a/src/services/telegram.rs
++++ b/src/services/telegram.rs
+@@ -20,6 +20,7 @@ use crate::services::file_ops::{
+     stable_file_identity, stable_path_identity, DirectoryAccess, DirectoryFileOptions,
+     StablePathIdentity,
+ };
++use crate::services::herdr;
+ use crate::services::memory::{self, MemoryTurn};
+ use crate::services::opencode;
+ use crate::ui::ai_screen::{self, HistoryItem, HistoryType, SessionData};
+@@ -7973,6 +7974,322 @@ fn generate_queue_id() -> String {
+ 
+ const STT_CONFIRM_CALLBACK_PREFIX: &str = "sttcf";
+ const STT_CONFIRM_ID_HEX_LEN: usize = 32;
++const HERDR_SCREEN_CALLBACK_DATA: &str = "herdr:screen";
++const HERDR_COMPLETION_POLL_SECONDS: u64 = 3;
++const HERDR_COMPLETION_SETTLE_SECONDS: u64 = 5;
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++struct HerdrCompletionConfig {
++    chat_id: ChatId,
++    minimum_duration: std::time::Duration,
++}
++
++#[derive(Default)]
++struct HerdrCompletionCycle {
++    target: Option<String>,
++    working_since: Option<std::time::Instant>,
++    settled_since: Option<std::time::Instant>,
++    cokacdir_owned: bool,
++}
++
++impl HerdrCompletionCycle {
++    fn observe(
++        &mut self,
++        target: &str,
++        status: &str,
++        cokacdir_owned: bool,
++        now: std::time::Instant,
++    ) -> Option<(std::time::Duration, bool)> {
++        if self.target.as_deref() != Some(target) {
++            self.target = Some(target.to_string());
++            self.working_since = None;
++            self.settled_since = None;
++            self.cokacdir_owned = false;
++        }
++
++        match status.to_ascii_lowercase().as_str() {
++            "working" => {
++                self.working_since.get_or_insert(now);
++                self.settled_since = None;
++                self.cokacdir_owned |= cokacdir_owned;
++                None
++            }
++            "blocked" => {
++                self.settled_since = None;
++                None
++            }
++            "idle" | "done" => {
++                let started = self.working_since?;
++                let settled = self.settled_since.get_or_insert(now);
++                if now.saturating_duration_since(*settled)
++                    < std::time::Duration::from_secs(HERDR_COMPLETION_SETTLE_SECONDS)
++                {
++                    return None;
++                }
++                self.working_since = None;
++                self.settled_since = None;
++                let owned = std::mem::take(&mut self.cokacdir_owned);
++                Some((now.saturating_duration_since(started), owned))
++            }
++            _ => {
++                self.working_since = None;
++                self.settled_since = None;
++                self.cokacdir_owned = false;
++                None
++            }
++        }
++    }
++}
++
++fn herdr_completion_config_from_values(
++    chat_id: Option<&str>,
++    minimum_seconds: Option<&str>,
++) -> Result<Option<HerdrCompletionConfig>, String> {
++    let Some(chat_id) = chat_id.map(str::trim).filter(|value| !value.is_empty()) else {
++        return Ok(None);
++    };
++    let chat_id = chat_id
++        .parse::<i64>()
++        .ok()
++        .filter(|value| *value != 0)
++        .ok_or_else(|| {
++            "COKAC_HERDR_COMPLETION_NOTIFY_CHAT_ID must be a non-zero integer.".to_string()
++        })?;
++    let minimum_seconds = minimum_seconds
++        .map(str::trim)
++        .filter(|value| !value.is_empty())
++        .unwrap_or("300")
++        .parse::<u64>()
++        .map_err(|_| {
++            "COKAC_HERDR_COMPLETION_NOTIFY_MIN_S must be a non-negative integer.".to_string()
++        })?;
++    Ok(Some(HerdrCompletionConfig {
++        chat_id: ChatId(chat_id),
++        minimum_duration: std::time::Duration::from_secs(minimum_seconds),
++    }))
++}
++
++fn herdr_completion_config() -> Result<Option<HerdrCompletionConfig>, String> {
++    let chat_id = std::env::var("COKAC_HERDR_COMPLETION_NOTIFY_CHAT_ID").ok();
++    let minimum = std::env::var("COKAC_HERDR_COMPLETION_NOTIFY_MIN_S").ok();
++    herdr_completion_config_from_values(chat_id.as_deref(), minimum.as_deref())
++}
++
++fn format_herdr_completion_duration(duration: std::time::Duration) -> String {
++    let seconds = duration.as_secs();
++    let hours = seconds / 3600;
++    let minutes = (seconds % 3600) / 60;
++    let seconds = seconds % 60;
++    if hours > 0 {
++        format!("{hours}시간 {minutes}분 {seconds}초")
++    } else if minutes > 0 {
++        format!("{minutes}분 {seconds}초")
++    } else {
++        format!("{seconds}초")
++    }
++}
++
++fn should_send_herdr_completion(
++    duration: std::time::Duration,
++    minimum_duration: std::time::Duration,
++) -> bool {
++    duration >= minimum_duration
++}
++
++async fn herdr_completion_watcher(bot: Bot, state: SharedState, config: HerdrCompletionConfig) {
++    let mut cycle = HerdrCompletionCycle::default();
++    let mut interval = tokio::time::interval(std::time::Duration::from_secs(
++        HERDR_COMPLETION_POLL_SECONDS,
++    ));
++    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
++
++    loop {
++        interval.tick().await;
++        let model = {
++            let data = state.lock().await;
++            get_model(&data.settings, config.chat_id)
++        };
++        if !herdr::is_herdr_model(model.as_deref()) {
++            cycle = HerdrCompletionCycle::default();
++            continue;
++        }
++        let Ok(target) = herdr::target_from_model(model.as_deref()) else {
++            cycle = HerdrCompletionCycle::default();
++            continue;
++        };
++        let status_target = target.clone();
++        let status =
++            match tokio::task::spawn_blocking(move || herdr::agent_status(&status_target)).await {
++                Ok(Ok(status)) => status,
++                Ok(Err(error)) => {
++                    msg_debug(&format!(
++                        "[herdr-completion] failed to read {target} status: {error}"
++                    ));
++                    continue;
++                }
++                Err(error) => {
++                    msg_debug(&format!(
++                        "[herdr-completion] status task failed for {target}: {error}"
++                    ));
++                    continue;
++                }
++            };
++        let completion = cycle.observe(
++            &target,
++            &status,
++            herdr::is_cokacdir_prompt_active(&target),
++            std::time::Instant::now(),
++        );
++        let Some((duration, cokacdir_owned)) = completion else {
++            continue;
++        };
++        if !should_send_herdr_completion(duration, config.minimum_duration) {
++            msg_debug(&format!(
++                "[herdr-completion] suppressed {target}: short task ({:.1}s)",
++                duration.as_secs_f64()
++            ));
++            continue;
++        }
++
++        let preview = if cokacdir_owned {
++            String::new()
++        } else {
++            let preview_target = target.clone();
++            tokio::task::spawn_blocking(move || herdr::completion_preview(&preview_target))
++                .await
++                .ok()
++                .and_then(Result::ok)
++                .unwrap_or_default()
++        };
++        let mut message = format!(
++            "✅ Herdr 작업 완료\n에이전트: {target}\n소요: {}",
++            format_herdr_completion_duration(duration)
++        );
++        if !preview.trim().is_empty() {
++            message.push_str("\n\n최근 결과:\n");
++            message.push_str(preview.trim());
++        }
++        shared_rate_limit_wait(&state, config.chat_id).await;
++        if let Err(error) = tg!(
++            "send_message",
++            bot.send_message(config.chat_id, message)
++                .reply_markup(herdr_screen_keyboard())
++                .await
++        ) {
++            msg_debug(&format!(
++                "[herdr-completion] failed to notify {target}: {}",
++                redact_err(&error)
++            ));
++        }
++    }
++}
++
++#[cfg(test)]
++mod herdr_completion_tests {
++    use super::*;
++
++    #[test]
++    fn completion_notifications_are_disabled_without_chat_id() {
++        assert_eq!(
++            herdr_completion_config_from_values(None, Some("300")),
++            Ok(None)
++        );
++        assert!(herdr_completion_config_from_values(Some("0"), Some("300")).is_err());
++        assert!(herdr_completion_config_from_values(Some("42"), Some("invalid")).is_err());
++    }
++
++    #[test]
++    fn completion_configuration_accepts_private_and_group_chats() {
++        let private = herdr_completion_config_from_values(Some("42"), None)
++            .unwrap()
++            .unwrap();
++        assert_eq!(private.chat_id, ChatId(42));
++        assert_eq!(private.minimum_duration.as_secs(), 300);
++
++        let group = herdr_completion_config_from_values(Some("-42"), Some("0"))
++            .unwrap()
++            .unwrap();
++        assert_eq!(group.chat_id, ChatId(-42));
++        assert_eq!(group.minimum_duration.as_secs(), 0);
++    }
++
++    #[test]
++    fn completion_cycle_tracks_duration_and_cokacdir_ownership() {
++        let started = std::time::Instant::now();
++        let mut cycle = HerdrCompletionCycle::default();
++        assert_eq!(cycle.observe("worker", "idle", false, started), None);
++        assert_eq!(cycle.observe("worker", "working", false, started), None);
++        assert_eq!(
++            cycle.observe(
++                "worker",
++                "working",
++                true,
++                started + std::time::Duration::from_secs(10)
++            ),
++            None
++        );
++        assert_eq!(
++            cycle.observe(
++                "worker",
++                "blocked",
++                false,
++                started + std::time::Duration::from_secs(20)
++            ),
++            None
++        );
++        assert_eq!(
++            cycle.observe(
++                "worker",
++                "done",
++                false,
++                started + std::time::Duration::from_secs(30)
++            ),
++            None
++        );
++        assert_eq!(
++            cycle.observe(
++                "worker",
++                "done",
++                false,
++                started + std::time::Duration::from_secs(36)
++            ),
++            Some((std::time::Duration::from_secs(36), true))
++        );
++    }
++
++    #[test]
++    fn completion_cycle_resets_when_target_changes() {
++        let started = std::time::Instant::now();
++        let mut cycle = HerdrCompletionCycle::default();
++        cycle.observe("first", "working", false, started);
++        assert_eq!(
++            cycle.observe(
++                "second",
++                "idle",
++                false,
++                started + std::time::Duration::from_secs(60)
++            ),
++            None
++        );
++    }
++
++    #[test]
++    fn completion_policy_suppresses_only_short_work() {
++        let minimum = std::time::Duration::from_secs(300);
++        assert!(!should_send_herdr_completion(
++            std::time::Duration::from_secs(299),
++            minimum
++        ));
++        assert!(should_send_herdr_completion(
++            std::time::Duration::from_secs(301),
++            minimum
++        ));
++        assert!(should_send_herdr_completion(
++            std::time::Duration::from_secs(300),
++            minimum
++        ));
++    }
++}
+ 
+ fn generate_stt_confirmation_id() -> String {
+     format!("{:032x}", rand::random::<u128>())
+@@ -8013,6 +8337,17 @@ fn stt_confirmation_keyboard(id: &str) -> InlineKeyboardMarkup {
+     ]])
+ }
+ 
++fn is_herdr_screen_callback(data: Option<&str>) -> bool {
++    data == Some(HERDR_SCREEN_CALLBACK_DATA)
++}
++
++fn herdr_screen_keyboard() -> InlineKeyboardMarkup {
++    InlineKeyboardMarkup::new([[InlineKeyboardButton::callback(
++        "📺 화면 보기",
++        HERDR_SCREEN_CALLBACK_DATA,
++    )]])
++}
++
+ /// Shared state: per-chat sessions + bot settings
+ struct SharedData {
+     sessions: HashMap<ChatId, ChatSession>,
+@@ -10360,6 +10695,7 @@ fn is_owner_only_command(text: &str) -> bool {
+             | "public"
+             | "setpollingtime"
+             | "model"
++            | "screen"
+             | "stt_model"
+             | "effort"
+             | "fast"
+@@ -11437,7 +11773,11 @@ async fn process_unit(
+             }
+         }
+         DispatchUnit::Callback(query) => {
+-            handle_stt_confirmation_callback(&bot, query, &state).await
++            if is_herdr_screen_callback(query.data.as_deref()) {
++                handle_herdr_screen_callback(&bot, query, &state).await
++            } else {
++                handle_stt_confirmation_callback(&bot, query, &state).await
++            }
+         }
+     }
+ }
+@@ -11626,6 +11966,7 @@ pub(crate) async fn run_bot_with_settings_identity(
+         teloxide::types::BotCommand::new("allowed", "Change allowed Claude tools (Claude only)"),
+         teloxide::types::BotCommand::new("setpollingtime", "Set API polling interval (ms)"),
+         teloxide::types::BotCommand::new("model", "Set AI model"),
++        teloxide::types::BotCommand::new("screen", "Show current Herdr pane"),
+         teloxide::types::BotCommand::new("stt_model", "Set speech recognition model"),
+         teloxide::types::BotCommand::new("effort", "Set Claude/Codex effort level"),
+         teloxide::types::BotCommand::new("fast", "Toggle Codex fast service tier"),
+@@ -11704,6 +12045,22 @@ pub(crate) async fn run_bot_with_settings_identity(
+         memory_write_tasks: memory_write_tasks.clone(),
+     };
+ 
++    let _herdr_completion_guard = match herdr_completion_config() {
++        Ok(Some(config)) => {
++            println!(
++                "  ✓ Herdr local completion notifications enabled (minimum {}s)",
++                config.minimum_duration.as_secs()
++            );
++            let handle = tokio::spawn(herdr_completion_watcher(bot.clone(), state.clone(), config));
++            Some(AbortOnDrop(handle.abort_handle()))
++        }
++        Ok(None) => None,
++        Err(error) => {
++            eprintln!("  ⚠ Herdr completion notifications disabled: {error}");
++            None
++        }
++    };
++
+     println!("  ✓ Bot connected — Listening for messages");
+     println!("  ✓ Scheduler started (5s interval)");
+ 
+@@ -12022,9 +12379,10 @@ async fn process_batch(
+                 }
+             }
+             UpdateKind::CallbackQuery(query) => {
+-                if parse_stt_confirmation_callback(query.data.as_deref()).is_none() {
+-                    // No other inline-keyboard feature is registered today. Ack
+-                    // unknown callbacks so Telegram does not leave a spinner up.
++                if parse_stt_confirmation_callback(query.data.as_deref()).is_none()
++                    && !is_herdr_screen_callback(query.data.as_deref())
++                {
++                    // Ack unknown callbacks so Telegram does not leave a spinner up.
+                     let _ = bot.answer_callback_query(query.id).await;
+                     continue;
+                 }
+@@ -12056,7 +12414,7 @@ async fn process_batch(
+                 query
+                     .message
+                     .as_ref()
+-                    .expect("STT callback dispatch always has a message")
++                    .expect("callback dispatch always has a message")
+                     .chat()
+                     .id
+             }
+@@ -14050,6 +14408,87 @@ async fn handle_stt_confirmation_callback(
+     Ok(())
+ }
+ 
++async fn send_herdr_screen(bot: &Bot, chat_id: ChatId, state: &SharedState) -> ResponseResult<()> {
++    let model = {
++        let data = state.lock().await;
++        get_model(&data.settings, chat_id)
++    };
++    if !herdr::is_herdr_model(model.as_deref()) {
++        shared_rate_limit_wait(state, chat_id).await;
++        tg!(
++            "send_message",
++            bot.send_message(
++                chat_id,
++                "현재 모델이 Herdr가 아닙니다. 먼저 /model herdr:<agent-name>으로 선택하세요.",
++            )
++            .await
++        )?;
++        return Ok(());
++    }
++
++    let result = tokio::task::spawn_blocking(move || herdr::read_screen(model.as_deref())).await;
++    let body = match result {
++        Ok(Ok((target, screen))) => {
++            let screen = if screen.is_empty() {
++                "(현재 화면에 출력이 없습니다.)".to_string()
++            } else {
++                screen
++            };
++            format!(
++                "<b>Herdr 화면 · {}</b>\n<pre>{}</pre>",
++                html_escape(&target),
++                html_escape(&screen)
++            )
++        }
++        Ok(Err(error)) => format!("Herdr 화면을 읽지 못했습니다: {}", html_escape(&error)),
++        Err(error) => format!(
++            "Herdr 화면 조회 작업이 중단되었습니다: {}",
++            html_escape(&error.to_string())
++        ),
++    };
++    send_long_message(bot, chat_id, &body, Some(ParseMode::Html), state).await
++}
++
++async fn handle_herdr_screen_callback(
++    bot: &Bot,
++    query: CallbackQuery,
++    state: &SharedState,
++) -> ResponseResult<()> {
++    let callback_id = query.id.clone();
++    let Some(message) = query.message.as_ref() else {
++        let _ = tg!(
++            "answer_callback_query",
++            bot.answer_callback_query(callback_id)
++                .text("이 화면 보기 버튼을 처리할 수 없습니다.")
++                .await
++        );
++        return Ok(());
++    };
++    let chat_id = message.chat().id;
++    let is_owner = {
++        let data = state.lock().await;
++        data.settings.owner_user_id == Some(query.from.id.0)
++    };
++    if !is_owner {
++        let _ = tg!(
++            "answer_callback_query",
++            bot.answer_callback_query(callback_id)
++                .text("봇 소유자만 화면을 볼 수 있습니다.")
++                .show_alert(true)
++                .await
++        );
++        return Ok(());
++    }
++
++    let _ = tg!(
++        "answer_callback_query",
++        bot.answer_callback_query(callback_id)
++            .text("화면을 불러옵니다.")
++            .await
++    );
++    send_herdr_screen(bot, chat_id, state).await
++}
++
+ async fn send_stt_error(
+     bot: &Bot,
+     chat_id: ChatId,
+@@ -16648,7 +17087,7 @@ async fn handle_message(
+ 
+     // Block all messages except /stop, /stopall, /queue while an AI request is in progress
+     let cmd_for_busy = command_name(&text);
+-    let is_busy_bypass = matches!(cmd_for_busy, Some("stop" | "stopall" | "queue"))
++    let is_busy_bypass = matches!(cmd_for_busy, Some("stop" | "stopall" | "queue" | "screen"))
+         || cmd_for_busy.map_or(false, |c| c.starts_with("stop_"));
+     if !is_busy_bypass {
+         // Determine the actual user text to queue (strip command prefix, pure string ops)
+@@ -16965,6 +17404,10 @@ async fn handle_message(
+             text.strip_prefix("/model").unwrap_or("").trim()
+         );
+         handle_model_command(&bot, chat_id, &text, &state, token).await?;
++    } else if is_cmd(&text, "screen") {
++        msg_debug("[handle_message] routing → /screen");
++        println!("  [{timestamp}] ◀ [{user_name}] /screen");
++        send_herdr_screen(&bot, chat_id, &state).await?;
+     } else if is_cmd(&text, "effort") {
+         msg_debug("[handle_message] routing → /effort");
+         println!(
+@@ -17317,6 +17760,7 @@ Ask in natural language to manage schedules.
+ <b>Settings</b>
+ <code>/model</code> — Show current AI model
+ <code>/model &lt;name&gt;</code> — Set model (claude/codex/agy/opencode or provider:model)
++<code>/screen</code> — Show the current Herdr pane
+ <code>/stt_model</code> — Show current speech recognition model
+ <code>/stt_model &lt;name|path:...&gt;</code> — Set transcriptor STT model
+ <code>/effort</code> — Show current Claude/Codex effort
+@@ -18101,7 +18545,9 @@ enum SessionProvider {
+ /// Detect provider from model prefix only (no availability fallback).
+ /// Returns "claude" when model is None or has no recognized prefix.
+ fn provider_from_model(model: Option<&str>) -> &'static str {
+-    if codex::is_codex_model(model) {
++    if herdr::is_herdr_model(model) {
++        "herdr"
++    } else if codex::is_codex_model(model) {
+         "codex"
+     } else if agy::is_agy_model(model) {
+         "agy"
+@@ -18122,6 +18568,11 @@ fn detect_provider(model: Option<&str>) -> &'static str {
+         "agy"
+     } else if !claude::is_claude_available() && opencode::is_opencode_available() {
+         "opencode"
++    } else if !claude::is_claude_available()
++        && herdr::is_herdr_available()
++        && herdr::target_from_model(None).is_ok()
++    {
++        "herdr"
+     } else {
+         "claude"
+     }
+@@ -23163,6 +23614,14 @@ fn resolve_model_name(name: &str) -> Result<String, &'static str> {
+         } else {
+             Err("opencode")
+         }
++    } else if herdr::is_herdr_model(Some(clean)) {
++        if !herdr::is_herdr_available() {
++            return Err("herdr");
++        }
++        if herdr::target_from_model(Some(clean)).is_err() {
++            return Err("");
++        }
++        Ok(clean.to_string())
+     } else {
+         Err("") // invalid format
+     }
+@@ -23600,6 +24059,7 @@ async fn handle_model_command(
+         let has_codex = codex::is_codex_available();
+         let has_agy = agy::is_agy_available();
+         let has_opencode = opencode::is_opencode_available();
++        let has_herdr = herdr::is_herdr_available();
+ 
+         let mut msg = match &current {
+             Some(m) => format!("Current model: <b>{}</b>\n", m),
+@@ -23610,8 +24070,10 @@ async fn handle_model_command(
+                     "codex"
+                 } else if has_agy {
+                     "agy"
+-                } else {
++                } else if has_opencode {
+                     "opencode"
++                } else {
++                    "herdr"
+                 };
+                 format!("Current model: <b>default</b> ({})\n", default_provider)
+             }
+@@ -23662,15 +24124,24 @@ async fn handle_model_command(
+                 msg.push_str(&format!("<code>/model opencode:{}</code>\n", model_id));
+             }
+         }
++        if has_herdr {
++            msg.push_str("\n<b>Herdr:</b>\n");
++            msg.push_str("<code>/model herdr:&lt;agent-name&gt;</code>\n");
++            if let Ok(target) = herdr::target_from_model(None) {
++                msg.push_str(&format!(
++                    "<code>/model herdr</code> — configured agent: {}\n",
++                    html_escape(&target)
++                ));
++            }
++        }
+ 
+         if msg.len() <= TELEGRAM_MSG_LIMIT {
+             shared_rate_limit_wait(state, chat_id).await;
+-            tg!(
+-                "send_message",
+-                bot.send_message(chat_id, msg)
+-                    .parse_mode(ParseMode::Html)
+-                    .await
+-            )?;
++            let mut request = bot.send_message(chat_id, msg).parse_mode(ParseMode::Html);
++            if herdr::is_herdr_model(current.as_deref()) {
++                request = request.reply_markup(herdr_screen_keyboard());
++            }
++            tg!("send_message", request.await)?;
+         } else {
+             // Build plain text version for file attachment
+             let plain = msg
+@@ -23800,12 +24271,11 @@ async fn handle_model_command(
+                 format!("Model set to <b>{}</b>.", model_id_escaped)
+             };
+             let msg = bot_settings_persistence_message(persistence, &msg);
+-            tg!(
+-                "send_message",
+-                bot.send_message(chat_id, msg)
+-                    .parse_mode(ParseMode::Html)
+-                    .await
+-            )?;
++            let mut request = bot.send_message(chat_id, msg).parse_mode(ParseMode::Html);
++            if herdr::is_herdr_model(Some(&model_id)) {
++                request = request.reply_markup(herdr_screen_keyboard());
++            }
++            tg!("send_message", request.await)?;
+         }
+         Err(provider) if !provider.is_empty() => {
+             shared_rate_limit_wait(state, chat_id).await;
+@@ -23825,7 +24295,8 @@ async fn handle_model_command(
+                  <code>/model claude</code> or <code>/model claude:&lt;model&gt;</code>\n\
+                  <code>/model codex</code> or <code>/model codex:&lt;model&gt;</code>\n\
+                  <code>/model agy</code> or <code>/model agy:&lt;model&gt;</code>\n\
+-                 <code>/model opencode</code> or <code>/model opencode:&lt;model&gt;</code>"
++                 <code>/model opencode</code> or <code>/model opencode:&lt;model&gt;</code>\n\
++                 <code>/model herdr:&lt;agent-name&gt;</code>"
+                 )
+                 .parse_mode(ParseMode::Html)
+                 .await
+@@ -24876,7 +25347,19 @@ async fn handle_text_message(
+             ));
+             ai_trace(&format!("[EXEC] provider={}, model={:?}, prompt_len={}, system_prompt_len={}, history_len={}, session={:?}, path={}",
+                 provider, model_clone, context_prompt.len(), system_prompt_owned.len(), history_clone.len(), session_id_clone, current_path_clone));
+-            let result = if provider == "opencode" {
++            let result = if provider == "herdr" {
++                msg_debug(&format!(
++                    "[handle_text_message] → herdr::execute, target={:?}, prompt_len={}",
++                    model_clone.as_deref().and_then(herdr::strip_herdr_prefix),
++                    context_prompt.len()
++                ));
++                herdr::execute_command_streaming(
++                    &context_prompt,
++                    tx.clone(),
++                    Some(cancel_token_clone),
++                    model_clone.as_deref(),
++                )
++            } else if provider == "opencode" {
+                 let opencode_model = model_clone
+                     .as_deref()
+                     .and_then(opencode::strip_opencode_prefix);
+@@ -30832,7 +31315,21 @@ async fn execute_schedule(
+             provider, model_clone_for_exec, resume_session_id, claude_fork_session
+         ));
+         let resume_ref = resume_session_id.as_deref();
+-        let result = if provider == "opencode" {
++        let result = if provider == "herdr" {
++            sched_debug(&format!(
++                "[execute_schedule] → herdr::execute, target={:?}, prompt_len={}",
++                model_clone_for_exec
++                    .as_deref()
++                    .and_then(herdr::strip_herdr_prefix),
++                prompt.len()
++            ));
++            herdr::execute_command_streaming(
++                &prompt,
++                tx.clone(),
++                Some(cancel_token_clone),
++                model_clone_for_exec.as_deref(),
++            )
++        } else if provider == "opencode" {
+             let opencode_model = model_clone_for_exec
+                 .as_deref()
+                 .and_then(opencode::strip_opencode_prefix);
+@@ -32349,7 +32846,19 @@ async fn process_bot_message(
+             "[process_bot_message:spawn_blocking] provider={}, model={:?}",
+             provider, model_clone
+         ));
+-        let result = if provider == "opencode" {
++        let result = if provider == "herdr" {
++            msg_debug(&format!(
++                "[process_bot_message] → herdr::execute, target={:?}, prompt_len={}",
++                model_clone.as_deref().and_then(herdr::strip_herdr_prefix),
++                prompt_for_ai.len()
++            ));
++            herdr::execute_command_streaming(
++                &prompt_for_ai,
++                tx.clone(),
++                Some(cancel_token_clone),
++                model_clone.as_deref(),
++            )
++        } else if provider == "opencode" {
+             let opencode_model = model_clone
+                 .as_deref()
+                 .and_then(opencode::strip_opencode_prefix);
+@@ -33990,7 +34499,14 @@ async fn execute_companion_ping(
+     };
+     let _ = spawn_tracked_blocking_task(request_tasks, move || {
+         let provider = detect_provider(model_clone.as_deref());
+-        let result = if provider == "opencode" {
++        let result = if provider == "herdr" {
++            herdr::execute_command_streaming(
++                &prompt,
++                tx.clone(),
++                Some(cancel_token_clone),
++                model_clone.as_deref(),
++            )
++        } else if provider == "opencode" {
+             let opencode_model = model_clone
+                 .as_deref()
+                 .and_then(opencode::strip_opencode_prefix);
