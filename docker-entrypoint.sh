@@ -40,7 +40,21 @@ install_npm_agent() {
 
 install_npm_agent codex @openai/codex
 install_npm_agent claude @anthropic-ai/claude-code
-install_npm_agent playwright-core playwright-core@1.61.1
+
+playwright_core_version="${PLAYWRIGHT_CORE_VERSION:-1.62.1}"
+playwright_core_package="${NPM_CONFIG_PREFIX}/lib/node_modules/playwright-core/package.json"
+installed_playwright_core_version=""
+if [ -f "${playwright_core_package}" ]; then
+  installed_playwright_core_version="$(node -p "require('${playwright_core_package}').version" 2>/dev/null || true)"
+fi
+
+if [ "${installed_playwright_core_version}" = "${playwright_core_version}" ]; then
+  echo "Using installed playwright-core ${installed_playwright_core_version}"
+else
+  echo "Installing playwright-core@${playwright_core_version} into ${NPM_CONFIG_PREFIX}..."
+  run_as_agent env NPM_CONFIG_PREFIX="${NPM_CONFIG_PREFIX}" \
+    npm install --global "playwright-core@${playwright_core_version}"
+fi
 
 if [ -x "${agy_bin}" ]; then
   echo "Using installed agy: ${agy_bin}"

@@ -83,11 +83,22 @@ agent. Bare `/model herdr` uses `COKAC_HERDR_AGENT`, which Compose defaults to
 terminal output, and extracts the final Codex TUI response block between
 the current prompt boundary and the next input prompt for Telegram. It does not
 add response-marker instructions to the agent prompt, and strips legacy marker
-lines left in an existing session. The prompt boundary parser recognizes both
-Codex's `› ` marker and AGY's `> ` marker; AGY output ends at the next long TUI
-separator so earlier turns are not returned. Codex `─ Worked for ...` status
-lines are separators and must not be delivered to Telegram. Other terminal
-layouts fall back to the terminal delta. `/stop`
+lines left in an existing session. The prompt boundary parser recognizes Codex's
+`› ` marker, AGY's `> ` marker, and Grok's `❯ ` marker (U+276F). AGY and Grok
+output ends at the next TUI separator so earlier turns are not returned. Codex
+`─ Worked for ...` and Grok `Worked for ...` status lines are separators and
+must not be delivered to Telegram. Grok wraps long prompts, stamps a clock on
+the right, and draws chrome (`◆` hooks, thought lines, the `Help improve`
+banner, a right-edge `█` scrollbar, and the `│ ❯` input box); those are
+stripped before the answer is published. Table rows that start with `│` are
+content, not the input box. Wrapped prompt echoes are matched without
+whitespace so a mid-word split such as `이`/`름` is not left in the answer.
+Grok repeats the current user prompt as a sticky viewport header; the
+extractor prefers the copy followed by `◆` hooks and keeps reading through
+later header replays until `Worked for`. Quote-box `│` padding and Herdr
+`┆` unwrap duplicates are stripped. Codex turns are bounded at the next `›`
+composer line so Grok-only separators do not apply, and `•` answer lines are
+kept while tool headers such as `• Ran` are dropped. Other terminal layouts fall back to the terminal delta. `/stop`
 also sends `ctrl+c` to the target agent. Cokacdir does not create or resume the
 Herdr agent; start it in a suitable Herdr pane first.
 

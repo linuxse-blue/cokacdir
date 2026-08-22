@@ -37,7 +37,7 @@ For non-trivial work, define verifiable success criteria and consider relevant B
 
 Use Korean for user-facing communication by default. Follow existing project language for code comments.
 
-For multi-step or long-running tasks (e.g. builds, refactoring), send real-time progress Push notifications to the active Telegram bot using `.agents/skills/telegram-push/scripts/push.sh "📢 [진행중 ...]"` at each completed step. Always execute background/long-running processes in a dedicated Herdr pane named `agy-worker` (using `.agents/skills/herdr/scripts/ensure_worker_pane.sh` to get or create it). Reuse the existing `agy-worker` pane instead of spawning new panes every time.
+For multi-step or long-running tasks (e.g. builds, refactoring), send real-time progress Push notifications to the active Telegram bot using `.agents/skills/telegram-push/scripts/push.sh "📢 [진행중 ...]"` at each completed step.
 
 ## Knowledge Memory & Visual Maps
 

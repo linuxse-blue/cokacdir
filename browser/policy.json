@@ -1,0 +1,26 @@
+{
+  "PasswordManagerEnabled": false,
+  "AutofillAddressEnabled": false,
+  "AutofillCreditCardEnabled": false,
+  "TranslateEnabled": false,
+  "DefaultNotificationsSetting": 2,
+  "DefaultGeolocationSetting": 2,
+  "DefaultSearchProviderEnabled": true,
+  "DefaultSearchProviderName": "DuckDuckGo",
+  "DefaultSearchProviderSearchURL": "https://duckduckgo.com/?q={searchTerms}",
+  "DefaultSearchProviderSuggestURL": "https://duckduckgo.com/ac/?q={searchTerms}",
+  "MaxConnectionsPerProxy": 16,
+  "NewTabPageLocation": "https://start.duckduckgo.com/",
+  "WebKit": {
+    "StandardFontFamily": "Noto Sans CJK KR",
+    "SansSerifFontFamily": "Noto Sans CJK KR",
+    "SerifFontFamily": "Noto Serif CJK KR",
+    "FixedFontFamily": "Noto Sans Mono CJK KR"
+  },
+  "ExtensionSettings": {
+    "*": {
+      "allowed_types": ["extension"],
+      "install_sources": ["*"]
+    }
+  }
+}

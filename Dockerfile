@@ -8,7 +8,7 @@ RUN apt-get update \
         git \
     && rm -rf /var/lib/apt/lists/* /tmp/*
 
-ARG COKACDIR_COMMIT=5ad75524c1ec566b4c4394d0ff545a5466f2f1da
+ARG COKACDIR_COMMIT=5e801d3fe1cb73eefa68b464d4a88e991131b84a
 RUN git init /src \
     && cd /src \
     && git remote add origin https://github.com/kstost/cokacdir.git \

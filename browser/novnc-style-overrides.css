@@ -1,0 +1,19 @@
+body,
+input,
+textarea,
+button,
+select,
+.noVNC_panel,
+#noVNC_control_bar,
+#noVNC_clipboard_text,
+#noVNC_status {
+  font-family: "Noto Sans CJK KR", "Noto Sans", "Apple SD Gothic Neo", "Malgun Gothic", sans-serif !important;
+}
+
+#noVNC_clipboard_text {
+  font-family: "Noto Sans CJK KR", "Noto Sans Mono CJK KR", "Noto Sans", monospace !important;
+}
+
+.noVNC_button {
+  opacity: 0.98;
+}

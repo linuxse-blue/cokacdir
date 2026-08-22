@@ -20,6 +20,7 @@ services:
       COKAC_CLAUDE_PATH: "/usr/local/bin/claude"
       COKAC_AGY_PATH: "/usr/local/bin/agy"
       COKAC_HERDR_PATH: "/usr/local/bin/herdr"
+      PLAYWRIGHT_CORE_VERSION: "${PLAYWRIGHT_CORE_VERSION:-1.62.1}"
       HERDR_MODE: "${HERDR_MODE:-internal}"
       COKAC_HERDR_AGENT: "${COKAC_HERDR_AGENT:-worker}"
       COKAC_HERDR_AGENT_KIND: "${COKAC_HERDR_AGENT_KIND:-codex}"
@@ -57,7 +58,7 @@ services:
       - ./data/gemini:/home/cokac/.gemini
       - ./data/claude:/home/cokac/.claude
       - ./data/local-share:/home/cokac/.local/share
-      - herdr-config:/home/cokac/.config/herdr
+      - ./herdr-config:/home/cokac/.config/herdr
 
       # Git 작업에 SSH 키가 필요할 때만 사용
       # - ~/.ssh:/root/.ssh:ro
@@ -65,16 +66,16 @@ services:
       #
 
   browser-base:
-    image: kernel-images-chromium-headful:452f342
+    image: kernel-images-chromium-headful:6056e50
     scale: 0
     build:
       # Kernel Images는 공식 사전 빌드 이미지가 없으므로 소스에서 빌드합니다.
       # 재현성을 위해 확인한 공식 저장소 커밋을 고정했습니다.
-      context: https://github.com/kernel/kernel-images.git#452f342387cd7f3680459cf13c257922ed46383b
+      context: https://github.com/kernel/kernel-images.git#6056e5034bde8ce7b6ef1d27a1e32ec535fee0cb
       dockerfile: images/chromium-headful/Dockerfile
 
   browser:
-    image: playwright-novnc:452f342
+    image: playwright-novnc:6056e50
     build:
       context: .
       dockerfile: browser/Dockerfile
@@ -97,6 +98,13 @@ services:
       WIDTH: "${BROWSER_WIDTH:-1920}"
       HEIGHT: "${BROWSER_HEIGHT:-1080}"
       BROWSER_ENABLE_WEBGL: "${BROWSER_ENABLE_WEBGL:-0}"
+      BROWSER_RENDERER_WATCHDOG: "${BROWSER_RENDERER_WATCHDOG:-1}"
+      BROWSER_RENDERER_WATCHDOG_INTERVAL_MS: "${BROWSER_RENDERER_WATCHDOG_INTERVAL_MS:-30000}"
+      BROWSER_RENDERER_WATCHDOG_COMMAND_TIMEOUT_MS: "${BROWSER_RENDERER_WATCHDOG_COMMAND_TIMEOUT_MS:-3000}"
+      BROWSER_RENDERER_WATCHDOG_FAILURE_THRESHOLD: "${BROWSER_RENDERER_WATCHDOG_FAILURE_THRESHOLD:-3}"
+      LANG: "${BROWSER_LANG:-ko_KR.UTF-8}"
+      LC_ALL: "${BROWSER_LANG:-ko_KR.UTF-8}"
+      LC_CTYPE: "${BROWSER_LANG:-ko_KR.UTF-8}"
       TZ: "${TZ:-Asia/Seoul}"
       RUN_AS_ROOT: "false"
       # 비워 두면 비밀번호 없이 접속합니다. 네트워크 공개 시 반드시 설정하세요.
@@ -105,6 +113,7 @@ services:
     ports:
       # noVNC 사용자 화면: http://호스트:7903/vnc.html
       - "${NOVNC_BIND_ADDRESS:-127.0.0.1}:${NOVNC_PORT:-7903}:6080/tcp"
+      - "9222:9222"
 
     # expose:
     #   # 호스트에는 공개하지 않고 Compose 내부에서만 사용합니다.
@@ -116,17 +125,15 @@ services:
       - "monintor-ui.duckdns.org:host-gateway"
     volumes:
       # 쿠키와 로그인 상태를 컨테이너 재시작 후에도 유지합니다.
-      - browser-profile:/home/kernel/user-data
-      - browser-recordings:/recordings
+      - ./browser-profile:/home/kernel/user-data
+      - ./browser-recordings:/recordings
 
     healthcheck:
       test: ["CMD", "node", "/usr/local/bin/browser-readiness.js"]
       interval: 60s
-      timeout: 8s
+      timeout: 15s
       retries: 12
       start_period: 30s
 
 volumes:
   herdr-config:
-  browser-profile:
-  browser-recordings:
